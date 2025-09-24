@@ -4,6 +4,7 @@ import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { projectId, publicAnonKey } from '../utils/supabase/info'
 import { Trophy, Medal, Award, Crown, Star, RefreshCw } from 'lucide-react'
+import { UserProfile } from './UserProfile'
 
 interface LeaderboardUser {
   id: string
@@ -19,10 +20,15 @@ interface LeaderboardResponse {
   total: number
 }
 
-export function Leaderboard() {
+interface LeaderboardProps {
+  currentUserProfile: any
+}
+
+export function Leaderboard({ currentUserProfile }: LeaderboardProps) {
   const [leaderboard, setLeaderboard] = useState<LeaderboardUser[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [selectedUser, setSelectedUser] = useState<string | null>(null)
 
   useEffect(() => {
     fetchLeaderboard()
@@ -201,16 +207,22 @@ export function Leaderboard() {
                           
                           <div>
                             <div className="flex items-center space-x-2">
-                              <span className="text-white font-medium">
+                              <button
+                                onClick={() => setSelectedUser(user.nice_id)}
+                                className="text-white font-medium hover:text-blue-400 transition-colors cursor-pointer"
+                              >
                                 {user.name}
-                              </span>
+                              </button>
                               {user.role === 'admin' && (
                                 <Crown className="w-4 h-4 text-yellow-400" />
                               )}
                             </div>
-                            <div className="text-white/60 text-sm">
+                            <button
+                              onClick={() => setSelectedUser(user.nice_id)}
+                              className="text-white/60 text-sm hover:text-blue-400 transition-colors cursor-pointer"
+                            >
                               ID: {user.nice_id}
-                            </div>
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -254,6 +266,15 @@ export function Leaderboard() {
           </div>
         </CardContent>
       </Card>
+      
+      {/* User Profile Modal */}
+      {selectedUser && (
+        <UserProfile
+          niceId={selectedUser}
+          onClose={() => setSelectedUser(null)}
+          currentUserProfile={currentUserProfile}
+        />
+      )}
     </div>
   )
 }

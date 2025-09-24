@@ -670,6 +670,32 @@ app.post('/make-server-eca1b907/open-pack', async (c) => {
     
     const levelResult = await addExperience(user.id, totalExp, 'pack_opening')
 
+    // Create posts for epic and legendary pokemon
+    const posts = await kv.get('posts') || []
+    for (const card of cards) {
+      if (card.rarity === 'epic' || card.rarity === 'legendary') {
+        const postId = `post_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+        const newPost = {
+          id: postId,
+          user_id: user.id,
+          type: 'pokemon_catch',
+          content: `Поймал ${card.rarity === 'legendary' ? 'легендарного' : 'эпического'} покемона ${card.name}! 🎉`,
+          pokemon_data: {
+            id: card.id,
+            name: card.name,
+            image: card.image,
+            rarity: card.rarity,
+            types: card.types
+          },
+          likes: [],
+          comments: [],
+          created_at: new Date().toISOString()
+        }
+        posts.push(newPost)
+      }
+    }
+    await kv.set('posts', posts)
+
     // Check achievements and quests
     await checkAchievements(user.id, 'pack_opened', { cards, newCards, collection })
     await updateQuests(user.id, 'open_pack', 1)
@@ -701,10 +727,15 @@ app.get('/make-server-eca1b907/auctions/active', async (c) => {
       return expiresAt > now
     })
     
-    // Add seller nice_id for display
+    // Add seller nice_id and highest bidder nice_id for display
     for (const auction of activeAuctions) {
       const seller = await kv.get(`user_${auction.sellerId}`)
       auction.sellerNiceId = seller?.nice_id || 'Unknown'
+      
+      if (auction.highestBidderId) {
+        const highestBidder = await kv.get(`user_${auction.highestBidderId}`)
+        auction.highestBidderNiceId = highestBidder?.nice_id || 'Unknown'
+      }
     }
 
     return c.json(activeAuctions)
@@ -726,8 +757,19 @@ app.get('/make-server-eca1b907/auctions/my', async (c) => {
 
     const auctions = await kv.get('auctions') || []
     
-    // Filter auctions by current user
-    const userAuctions = auctions.filter((auction: any) => auction.sellerId === user.id)
+    // Filter auctions by current user and add bidder info
+    const userAuctions = []
+    
+    for (const auction of auctions) {
+      if (auction.sellerId === user.id) {
+        // Add highest bidder info if exists
+        if (auction.highestBidderId) {
+          const highestBidder = await kv.get(`user_${auction.highestBidderId}`)
+          auction.highestBidderNiceId = highestBidder?.nice_id || 'Unknown'
+        }
+        userAuctions.push(auction)
+      }
+    }
 
     return c.json(userAuctions)
   } catch (error) {
@@ -785,10 +827,12 @@ app.post('/make-server-eca1b907/auctions/create', async (c) => {
       startingPrice: parseInt(startingPrice),
       currentPrice: parseInt(startingPrice),
       highestBidderId: null,
+      highestBidderNiceId: null,
       status: 'active',
       createdAt: new Date().toISOString(),
       expiresAt: expiresAt.toISOString(),
-      bids: []
+      bids: [],
+      escrowAmount: 0 // Amount held in escrow for current highest bidder
     }
 
     auctions.push(newAuction)
@@ -845,6 +889,11 @@ app.post('/make-server-eca1b907/auctions/bid', async (c) => {
       return c.json({ error: 'Cannot bid on own auction' }, 400)
     }
 
+    // Check if user is not already the highest bidder
+    if (auction.highestBidderId === user.id) {
+      return c.json({ error: 'You are already the highest bidder' }, 400)
+    }
+
     // Check if bid is higher than current price
     if (bidAmount <= auction.currentPrice) {
       return c.json({ error: 'Bid must be higher than current price' }, 400)
@@ -860,20 +909,26 @@ app.post('/make-server-eca1b907/auctions/bid', async (c) => {
     if (auction.highestBidderId && auction.highestBidderId !== user.id) {
       const previousBidder = await kv.get(`user_${auction.highestBidderId}`)
       if (previousBidder) {
-        previousBidder.poke_coins += auction.currentPrice
+        previousBidder.poke_coins += auction.escrowAmount
         await kv.set(`user_${auction.highestBidderId}`, previousBidder)
       }
     }
 
-    // Deduct coins from current bidder
+    // Deduct coins from current bidder (hold in escrow)
     userProfile.poke_coins -= bidAmount
     await kv.set(`user_${user.id}`, userProfile)
+
+    // Get bidder's nice_id for display
+    const bidderNiceId = userProfile.nice_id || 'Unknown'
 
     // Update auction
     auction.currentPrice = bidAmount
     auction.highestBidderId = user.id
+    auction.highestBidderNiceId = bidderNiceId
+    auction.escrowAmount = bidAmount
     auction.bids.push({
       bidderId: user.id,
+      bidderNiceId: bidderNiceId,
       amount: bidAmount,
       timestamp: new Date().toISOString()
     })
@@ -892,18 +947,21 @@ app.post('/make-server-eca1b907/auctions/bid', async (c) => {
       // Check social trader achievement
       await checkAchievements(user.id, 'auction_purchase', {})
 
-      // Give coins to seller
+      // Give coins to seller (from escrow)
       const seller = await kv.get(`user_${auction.sellerId}`)
       if (seller) {
-        seller.poke_coins += bidAmount
+        seller.poke_coins += auction.escrowAmount
         await kv.set(`user_${auction.sellerId}`, seller)
         
         // Check coins achievement for seller
         await checkAchievements(auction.sellerId, 'coins_updated', { poke_coins: seller.poke_coins })
         
         // Check big seller achievement
-        await checkAchievements(auction.sellerId, 'auction_sale', { price: bidAmount })
+        await checkAchievements(auction.sellerId, 'auction_sale', { price: auction.escrowAmount })
       }
+      
+      // Clear escrow since auction is completed
+      auction.escrowAmount = 0
     }
 
     auctions[auctionIndex] = auction
@@ -912,6 +970,71 @@ app.post('/make-server-eca1b907/auctions/bid', async (c) => {
     return c.json({ success: true, auction })
   } catch (error) {
     console.log('Place bid error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Complete expired auctions
+app.post('/make-server-eca1b907/auctions/complete-expired', async (c) => {
+  try {
+    const auctions = await kv.get('auctions') || []
+    const now = new Date()
+    let completedCount = 0
+    
+    for (let i = 0; i < auctions.length; i++) {
+      const auction = auctions[i]
+      
+      if (auction.status === 'active') {
+        const expiresAt = new Date(auction.expiresAt)
+        
+        if (expiresAt <= now) {
+          // Auction has expired
+          if (auction.highestBidderId && auction.escrowAmount > 0) {
+            // There was a winning bid - complete the sale
+            auction.status = 'sold'
+            
+            // Transfer pokemon to buyer
+            const buyerCollection = await kv.get(`collection_${auction.highestBidderId}`) || {}
+            buyerCollection[auction.pokemonId] = (buyerCollection[auction.pokemonId] || 0) + 1
+            await kv.set(`collection_${auction.highestBidderId}`, buyerCollection)
+            
+            // Give coins to seller from escrow
+            const seller = await kv.get(`user_${auction.sellerId}`)
+            if (seller) {
+              seller.poke_coins += auction.escrowAmount
+              await kv.set(`user_${auction.sellerId}`, seller)
+              
+              // Check achievements
+              await checkAchievements(auction.sellerId, 'coins_updated', { poke_coins: seller.poke_coins })
+              await checkAchievements(auction.sellerId, 'auction_sale', { price: auction.escrowAmount })
+            }
+            
+            // Check achievements for buyer
+            await checkAchievements(auction.highestBidderId, 'auction_purchase', {})
+            
+            auction.escrowAmount = 0
+          } else {
+            // No bids - return pokemon to seller
+            auction.status = 'expired'
+            
+            const sellerCollection = await kv.get(`collection_${auction.sellerId}`) || {}
+            sellerCollection[auction.pokemonId] = (sellerCollection[auction.pokemonId] || 0) + 1
+            await kv.set(`collection_${auction.sellerId}`, sellerCollection)
+          }
+          
+          auctions[i] = auction
+          completedCount++
+        }
+      }
+    }
+    
+    if (completedCount > 0) {
+      await kv.set('auctions', auctions)
+    }
+    
+    return c.json({ completedCount })
+  } catch (error) {
+    console.log('Complete expired auctions error:', error)
     return c.json({ error: 'Internal server error' }, 500)
   }
 })
@@ -1267,6 +1390,502 @@ app.get('/make-server-eca1b907/leaderboard', async (c) => {
     })
   } catch (error) {
     console.log('Leaderboard error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Upload avatar
+app.post('/make-server-eca1b907/upload-avatar', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const body = await c.req.formData()
+    const file = body.get('avatar') as File
+    
+    if (!file) {
+      return c.json({ error: 'No file provided' }, 400)
+    }
+
+    // Check file size (max 1MB)
+    if (file.size > 1024 * 1024) {
+      return c.json({ error: 'File size must be less than 1MB' }, 400)
+    }
+
+    // Check file type
+    if (!file.type.startsWith('image/')) {
+      return c.json({ error: 'File must be an image' }, 400)
+    }
+
+    const bucketName = 'make-eca1b907-avatars'
+    
+    // Create bucket if it doesn't exist
+    const { data: buckets } = await supabase.storage.listBuckets()
+    const bucketExists = buckets?.some(bucket => bucket.name === bucketName)
+    if (!bucketExists) {
+      await supabase.storage.createBucket(bucketName, { public: false })
+    }
+
+    // Get user profile to delete old avatar
+    const userProfile = await kv.get(`user_${user.id}`)
+    if (userProfile?.avatar_path) {
+      await supabase.storage.from(bucketName).remove([userProfile.avatar_path])
+    }
+
+    // Upload new avatar
+    const fileName = `${user.id}-${Date.now()}.${file.name.split('.').pop()}`
+    const { data, error: uploadError } = await supabase.storage
+      .from(bucketName)
+      .upload(fileName, file)
+
+    if (uploadError) {
+      console.log('Upload error:', uploadError)
+      return c.json({ error: 'Upload failed' }, 500)
+    }
+
+    // Get signed URL
+    const { data: signedUrlData } = await supabase.storage
+      .from(bucketName)
+      .createSignedUrl(fileName, 60 * 60 * 24 * 365) // 1 year
+
+    // Update user profile
+    if (userProfile) {
+      userProfile.avatar_path = fileName
+      userProfile.avatar_url = signedUrlData?.signedUrl
+      await kv.set(`user_${user.id}`, userProfile)
+    }
+
+    return c.json({ 
+      success: true, 
+      avatar_url: signedUrlData?.signedUrl,
+      avatar_path: fileName
+    })
+  } catch (error) {
+    console.log('Upload avatar error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Get posts feed
+app.get('/make-server-eca1b907/posts', async (c) => {
+  try {
+    const posts = await kv.get('posts') || []
+    
+    // Sort by created date (newest first)
+    const sortedPosts = posts
+      .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, 50) // Limit to 50 most recent posts
+    
+    // Add user info to posts
+    for (const post of sortedPosts) {
+      const userProfile = await kv.get(`user_${post.user_id}`)
+      if (userProfile) {
+        post.user_name = userProfile.name
+        post.user_nice_id = userProfile.nice_id
+        post.user_avatar_url = userProfile.avatar_url
+        
+        // Refresh avatar URL if needed
+        if (userProfile.avatar_path && (!userProfile.avatar_url || userProfile.avatar_url.includes('expired'))) {
+          const { data: signedUrlData } = await supabase.storage
+            .from('make-eca1b907-avatars')
+            .createSignedUrl(userProfile.avatar_path, 60 * 60 * 24 * 365)
+          
+          if (signedUrlData?.signedUrl) {
+            userProfile.avatar_url = signedUrlData.signedUrl
+            await kv.set(`user_${post.user_id}`, userProfile)
+            post.user_avatar_url = signedUrlData.signedUrl
+          }
+        }
+      }
+    }
+
+    return c.json(sortedPosts)
+  } catch (error) {
+    console.log('Get posts error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Create post
+app.post('/make-server-eca1b907/posts', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const { content, type = 'user_post', pokemon_data = null } = await c.req.json()
+    
+    if (!content || content.trim().length === 0) {
+      return c.json({ error: 'Post content cannot be empty' }, 400)
+    }
+
+    if (content.length > 500) {
+      return c.json({ error: 'Post content too long (max 500 characters)' }, 400)
+    }
+
+    const posts = await kv.get('posts') || []
+    const postId = `post_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    
+    const newPost = {
+      id: postId,
+      user_id: user.id,
+      type: type, // 'user_post', 'pokemon_catch', 'achievement'
+      content: content.trim(),
+      pokemon_data: pokemon_data,
+      likes: [],
+      comments: [],
+      created_at: new Date().toISOString()
+    }
+
+    posts.push(newPost)
+    await kv.set('posts', posts)
+
+    return c.json({ success: true, post: newPost })
+  } catch (error) {
+    console.log('Create post error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Like/unlike post
+app.post('/make-server-eca1b907/posts/:postId/like', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const post = posts[postIndex]
+    const likeIndex = post.likes.indexOf(user.id)
+    
+    if (likeIndex === -1) {
+      // Add like
+      post.likes.push(user.id)
+    } else {
+      // Remove like
+      post.likes.splice(likeIndex, 1)
+    }
+
+    posts[postIndex] = post
+    await kv.set('posts', posts)
+
+    return c.json({ success: true, likes_count: post.likes.length, liked: likeIndex === -1 })
+  } catch (error) {
+    console.log('Like post error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Add comment to post
+app.post('/make-server-eca1b907/posts/:postId/comment', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const { content } = await c.req.json()
+    
+    if (!content || content.trim().length === 0) {
+      return c.json({ error: 'Comment cannot be empty' }, 400)
+    }
+
+    if (content.length > 200) {
+      return c.json({ error: 'Comment too long (max 200 characters)' }, 400)
+    }
+
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const userProfile = await kv.get(`user_${user.id}`)
+    const commentId = `comment_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    
+    const newComment = {
+      id: commentId,
+      user_id: user.id,
+      user_name: userProfile?.name || 'Unknown',
+      user_nice_id: userProfile?.nice_id || 'Unknown',
+      content: content.trim(),
+      created_at: new Date().toISOString()
+    }
+
+    const post = posts[postIndex]
+    post.comments.push(newComment)
+    posts[postIndex] = post
+    await kv.set('posts', posts)
+
+    return c.json({ success: true, comment: newComment })
+  } catch (error) {
+    console.log('Add comment error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Edit post
+app.put('/make-server-eca1b907/posts/:postId', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const { content } = await c.req.json()
+    
+    if (!content || content.trim().length === 0) {
+      return c.json({ error: 'Post content cannot be empty' }, 400)
+    }
+
+    if (content.length > 500) {
+      return c.json({ error: 'Post content too long (max 500 characters)' }, 400)
+    }
+
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const post = posts[postIndex]
+    
+    // Only post owner can edit
+    if (post.user_id !== user.id) {
+      return c.json({ error: 'Not authorized to edit this post' }, 403)
+    }
+
+    // Don't allow editing pokemon catch posts
+    if (post.type === 'pokemon_catch') {
+      return c.json({ error: 'Cannot edit pokemon catch posts' }, 400)
+    }
+
+    post.content = content.trim()
+    post.edited_at = new Date().toISOString()
+    
+    posts[postIndex] = post
+    await kv.set('posts', posts)
+
+    return c.json({ success: true, post })
+  } catch (error) {
+    console.log('Edit post error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Delete post
+app.delete('/make-server-eca1b907/posts/:postId', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const post = posts[postIndex]
+    
+    // Only post owner can delete
+    if (post.user_id !== user.id) {
+      return c.json({ error: 'Not authorized to delete this post' }, 403)
+    }
+
+    posts.splice(postIndex, 1)
+    await kv.set('posts', posts)
+
+    return c.json({ success: true })
+  } catch (error) {
+    console.log('Delete post error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Edit comment
+app.put('/make-server-eca1b907/posts/:postId/comment/:commentId', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const commentId = c.req.param('commentId')
+    const { content } = await c.req.json()
+    
+    if (!content || content.trim().length === 0) {
+      return c.json({ error: 'Comment cannot be empty' }, 400)
+    }
+
+    if (content.length > 200) {
+      return c.json({ error: 'Comment too long (max 200 characters)' }, 400)
+    }
+
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const post = posts[postIndex]
+    const commentIndex = post.comments.findIndex((c: any) => c.id === commentId)
+    
+    if (commentIndex === -1) {
+      return c.json({ error: 'Comment not found' }, 404)
+    }
+
+    const comment = post.comments[commentIndex]
+    
+    // Only comment owner can edit
+    if (comment.user_id !== user.id) {
+      return c.json({ error: 'Not authorized to edit this comment' }, 403)
+    }
+
+    comment.content = content.trim()
+    comment.edited_at = new Date().toISOString()
+    
+    post.comments[commentIndex] = comment
+    posts[postIndex] = post
+    await kv.set('posts', posts)
+
+    return c.json({ success: true, comment })
+  } catch (error) {
+    console.log('Edit comment error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Delete comment
+app.delete('/make-server-eca1b907/posts/:postId/comment/:commentId', async (c) => {
+  try {
+    const accessToken = c.req.header('Authorization')?.split(' ')[1]
+    const { data: { user }, error } = await supabase.auth.getUser(accessToken)
+    
+    if (!user?.id) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    const postId = c.req.param('postId')
+    const commentId = c.req.param('commentId')
+    const posts = await kv.get('posts') || []
+    const postIndex = posts.findIndex((p: any) => p.id === postId)
+    
+    if (postIndex === -1) {
+      return c.json({ error: 'Post not found' }, 404)
+    }
+
+    const post = posts[postIndex]
+    const commentIndex = post.comments.findIndex((c: any) => c.id === commentId)
+    
+    if (commentIndex === -1) {
+      return c.json({ error: 'Comment not found' }, 404)
+    }
+
+    const comment = post.comments[commentIndex]
+    
+    // Comment owner or post owner can delete
+    if (comment.user_id !== user.id && post.user_id !== user.id) {
+      return c.json({ error: 'Not authorized to delete this comment' }, 403)
+    }
+
+    post.comments.splice(commentIndex, 1)
+    posts[postIndex] = post
+    await kv.set('posts', posts)
+
+    return c.json({ success: true })
+  } catch (error) {
+    console.log('Delete comment error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
+// Get user profile by nice_id (for viewing other users)
+app.get('/make-server-eca1b907/user/:niceId', async (c) => {
+  try {
+    const niceId = c.req.param('niceId')
+    const userId = await kv.get(`user_by_nice_id_${niceId}`)
+    
+    if (!userId) {
+      return c.json({ error: 'User not found' }, 404)
+    }
+
+    const userProfile = await kv.get(`user_${userId}`)
+    if (!userProfile) {
+      return c.json({ error: 'User profile not found' }, 404)
+    }
+
+    // Get level data
+    const levelData = await kv.get(`level_${userId}`)
+    
+    // Refresh avatar URL if needed
+    if (userProfile.avatar_path && (!userProfile.avatar_url || userProfile.avatar_url.includes('expired'))) {
+      const { data: signedUrlData } = await supabase.storage
+        .from('make-eca1b907-avatars')
+        .createSignedUrl(userProfile.avatar_path, 60 * 60 * 24 * 365)
+      
+      if (signedUrlData?.signedUrl) {
+        userProfile.avatar_url = signedUrlData.signedUrl
+        await kv.set(`user_${userId}`, userProfile)
+      }
+    }
+
+    // Get user's posts
+    const allPosts = await kv.get('posts') || []
+    const userPosts = allPosts
+      .filter((post: any) => post.user_id === userId)
+      .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+      .slice(0, 20) // Latest 20 posts
+
+    return c.json({
+      user: {
+        id: userProfile.id,
+        name: userProfile.name,
+        nice_id: userProfile.nice_id,
+        role: userProfile.role,
+        avatar_url: userProfile.avatar_url,
+        created_at: userProfile.created_at,
+        level: levelData?.level || 1,
+        experience: levelData?.experience || userProfile.experience || 0
+      },
+      posts: userPosts
+    })
+  } catch (error) {
+    console.log('Get user profile error:', error)
     return c.json({ error: 'Internal server error' }, 500)
   }
 })

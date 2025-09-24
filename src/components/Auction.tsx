@@ -53,7 +53,11 @@ export function Auction({ onPurchase }: AuctionProps) {
 
   useEffect(() => {
     fetchData()
-    const interval = setInterval(fetchData, 10000) // Refresh every 10 seconds
+    completeExpiredAuctions() // Check for expired auctions on load
+    const interval = setInterval(() => {
+      fetchData()
+      completeExpiredAuctions() // Check periodically for expired auctions
+    }, 10000) // Refresh every 10 seconds
     return () => clearInterval(interval)
   }, [])
 
@@ -113,6 +117,22 @@ export function Auction({ onPurchase }: AuctionProps) {
       console.error('Error fetching auction data:', error)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const completeExpiredAuctions = async () => {
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session?.access_token) {
+        await fetch(`https://${projectId}.supabase.co/functions/v1/make-server-eca1b907/auctions/complete-expired`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${session.access_token}`,
+          },
+        })
+      }
+    } catch (error) {
+      console.error('Error completing expired auctions:', error)
     }
   }
 
@@ -313,10 +333,20 @@ export function Auction({ onPurchase }: AuctionProps) {
                           {RARITY_NAMES[pokemonData.rarity as keyof typeof RARITY_NAMES]}
                         </Badge>
                         
-                        <div className="bg-yellow-500/20 rounded-lg p-2">
+                        <div className="bg-yellow-500/20 rounded-lg p-2 space-y-1">
                           <div className="text-yellow-300 text-xl font-bold">
                             ⚡ {auction.currentPrice || auction.startingPrice} PokéCoins
                           </div>
+                          {auction.highestBidderNiceId && (
+                            <div className="text-yellow-200 text-sm">
+                              🏆 Последняя ставка: {auction.highestBidderNiceId}
+                            </div>
+                          )}
+                          {!auction.highestBidderNiceId && (
+                            <div className="text-yellow-200 text-sm">
+                              💰 Стартовая цена
+                            </div>
+                          )}
                         </div>
                         
                         {auction.expiresAt && (
@@ -332,7 +362,7 @@ export function Auction({ onPurchase }: AuctionProps) {
                           onClick={() => buyPokemon(auction)}
                           className="w-full bg-green-600 hover:bg-green-700 text-white font-bold"
                         >
-                          💰 Сделать ставку
+                          💰 Ставка: {(auction.currentPrice || auction.startingPrice) + 10} PokéCoins
                         </Button>
                       </div>
                     </CardContent>
@@ -473,16 +503,41 @@ export function Auction({ onPurchase }: AuctionProps) {
                           {RARITY_NAMES[pokemonData.rarity as keyof typeof RARITY_NAMES]}
                         </Badge>
                         
-                        <div className="text-yellow-400 text-xl">
-                          ⚡ {auction.price} PokéCoins
+                        <div className="bg-yellow-500/20 rounded-lg p-2 space-y-1">
+                          <div className="text-yellow-300 text-lg font-bold">
+                            ⚡ {auction.currentPrice || auction.startingPrice} PokéCoins
+                          </div>
+                          {auction.highestBidderNiceId && (
+                            <div className="text-yellow-200 text-sm">
+                              🏆 Лидирует: {auction.highestBidderNiceId}
+                            </div>
+                          )}
+                          {!auction.highestBidderNiceId && (
+                            <div className="text-yellow-200 text-sm">
+                              💰 Ставок нет
+                            </div>
+                          )}
                         </div>
                         
                         <Badge 
                           variant="outline" 
-                          className="text-blue-400 border-blue-400"
+                          className={`${auction.status === 'active' ? 'text-blue-400 border-blue-400' : 
+                                      auction.status === 'sold' ? 'text-green-400 border-green-400' : 
+                                      'text-red-400 border-red-400'}`}
                         >
-                          {auction.status === 'active' ? 'Активен' : auction.status}
+                          {auction.status === 'active' ? 'Активен' : 
+                           auction.status === 'sold' ? 'Продан' : 
+                           auction.status === 'expired' ? 'Истек' : auction.status}
                         </Badge>
+                        
+                        {auction.expiresAt && auction.status === 'active' && (
+                          <div className="bg-black/20 rounded px-2 py-1">
+                            <AuctionTimer 
+                              expiresAt={auction.expiresAt} 
+                              onExpired={() => fetchData()}
+                            />
+                          </div>
+                        )}
                       </div>
                     </CardContent>
                   </Card>

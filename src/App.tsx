@@ -265,7 +265,7 @@ export default function App() {
           </TabsList>
 
           <TabsContent value="dashboard">
-            <Dashboard userProfile={userProfile} />
+            <Dashboard userProfile={userProfile} onAvatarUpdate={refreshProfile} />
           </TabsContent>
 
           <TabsContent value="pokedex">
@@ -297,7 +297,7 @@ export default function App() {
           </TabsContent>
 
           <TabsContent value="leaderboard">
-            <Leaderboard />
+            <Leaderboard currentUserProfile={userProfile} />
           </TabsContent>
 
           {userProfile?.role === 'admin' && (
